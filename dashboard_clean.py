@@ -69,18 +69,35 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ===== HEADER =====
-st.markdown("""
-<div class="title-container">
-    <h1 class="main-title">Counseling Bot Analytics Dashboard</h1>
-</div>
-""", unsafe_allow_html=True)
+
+# ===== HELPER FUNCTIONS =====
+def has_real_name(username):
+    """Check if username appears to be a real name (not UUID or system-generated)"""
+    if pd.isna(username) or username == 'Unknown' or username == '':
+        return False
+    
+    username_str = str(username).strip()
+    
+    # Check for system-generated patterns like "User-abc123" or "Guest-abc123"
+    if username_str.startswith(('User-', 'Guest-', 'user-', 'guest-')):
+        return False
+    
+    # Check if it looks like a UUID (contains many hyphens and hex characters)
+    if len(username_str) > 20 and username_str.count('-') >= 3:
+        return False
+    
+    # Check if it's all hex characters (with or without hyphens)
+    cleaned = username_str.replace('-', '').replace('_', '')
+    if len(cleaned) > 16 and all(c in '0123456789abcdefABCDEF' for c in cleaned):
+        return False
+    
+    return True
 
 # ===== LOAD DATA =====
 @st.cache_data(ttl=300)
-def load_data(api_key, days, project_name):
+def load_data(api_key, days, project_name, force_refresh=False):
     """Load conversation data from LangSmith API"""
-    conversations = get_langsmith_data(api_key, days, project_name)
+    conversations = get_langsmith_data(api_key, days, project_name, force_full_refresh=force_refresh)
     
     if not conversations:
         st.error("No conversations found!")
@@ -109,9 +126,25 @@ def load_data(api_key, days, project_name):
     
     return df
 
+# ===== HEADER WITH REFRESH BUTTON =====
+col_title, col_refresh = st.columns([5, 1])
+
+with col_title:
+    st.markdown("""
+    <div class="title-container">
+        <h1 class="main-title">Counseling Bot Analytics Dashboard</h1>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col_refresh:
+    st.write("")  # Spacing
+    if st.button("🔄 Force Refresh", help="Clear cache and fetch all data from scratch"):
+        st.cache_data.clear()
+        st.rerun()
+
 # Load data
 try:
-    # Default to 300 days to get all available data
+    # Default to 355 days to get all available data on first run
     days_to_load = 355
     
     with st.spinner("Loading conversation data from LangSmith..."):
@@ -185,13 +218,14 @@ try:
     # ===== KEY METRICS =====
     st.markdown("---")
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     total_conversations = len(filtered_df)
     successful_conversations = int(filtered_df['success'].sum())
     success_rate = (successful_conversations / total_conversations * 100) if total_conversations > 0 else 0
     avg_response_time = filtered_df['latency_seconds'].mean()
     unique_users = filtered_df['user_name'].nunique()
+    slow_traces = len(filtered_df[filtered_df['latency_seconds'] > 15])
     
     with col1:
         st.markdown(f"""
@@ -222,6 +256,14 @@ try:
         <div class="metric-card">
             <div class="metric-value">{unique_users:,}</div>
             <div class="metric-label">Unique Users</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col5:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-value">{slow_traces:,}</div>
+            <div class="metric-label">Slow Traces (>15s)</div>
         </div>
         """, unsafe_allow_html=True)
     
@@ -333,7 +375,10 @@ try:
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        top_users = filtered_df.groupby('user_name').agg({
+        # Filter to only users with real names
+        real_users_df = filtered_df[filtered_df['user_name'].apply(has_real_name)]
+        
+        top_users = real_users_df.groupby('user_name').agg({
             'conversation_id': 'count',
             'success': lambda x: (x.sum() / len(x) * 100),
             'latency_seconds': 'mean'
@@ -403,7 +448,10 @@ try:
     st.markdown("---")
     st.header("💬 Recent Conversations")
     
-    recent = filtered_df.nlargest(20, 'timestamp')[
+    # Filter to only users with real names
+    real_users_df = filtered_df[filtered_df['user_name'].apply(has_real_name)]
+    
+    recent = real_users_df.nlargest(30, 'timestamp')[
         ['timestamp', 'user_name', 'run_name', 'latency_seconds', 'success', 'status']
     ].copy()
     
@@ -418,9 +466,28 @@ try:
     
     # ===== FOOTER =====
     st.markdown("---")
+    
+    # Check if cache exists
+    import os
+    cache_dir = os.path.join(os.path.dirname(__file__), '.cache')
+    timestamp_file = os.path.join(cache_dir, 'last_fetch_timestamp.json')
+    
+    cache_info = ""
+    if os.path.exists(timestamp_file):
+        import json
+        try:
+            with open(timestamp_file, 'r') as f:
+                data = json.load(f)
+                last_fetch = datetime.fromisoformat(data['last_fetch'])
+                cache_info = f" | 🔄 Cache updated: {last_fetch.strftime('%Y-%m-%d %H:%M:%S')} | Next refresh: incremental"
+        except:
+            cache_info = " | 🔄 Using incremental updates"
+    else:
+        cache_info = " | 🔄 First run - building cache"
+    
     st.caption(f"""
         📊 Dashboard showing {len(filtered_df):,} conversations from {unique_users:,} users | 
-        Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{cache_info}
     """)
 
 except Exception as e:

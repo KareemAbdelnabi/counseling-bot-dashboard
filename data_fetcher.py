@@ -4,13 +4,60 @@ from langsmith import Client
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import json
+import os
+import pickle
+
+# Cache directory for persistent storage
+CACHE_DIR = os.path.join(os.path.dirname(__file__), '.cache')
+CACHE_FILE = os.path.join(CACHE_DIR, 'conversations_cache.pkl')
+TIMESTAMP_FILE = os.path.join(CACHE_DIR, 'last_fetch_timestamp.json')
+
+# Ensure cache directory exists
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 
 
-def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counseling-bot-production"):
+def get_last_fetch_timestamp():
+    """Get the timestamp of the last successful fetch."""
+    if os.path.exists(TIMESTAMP_FILE):
+        try:
+            with open(TIMESTAMP_FILE, 'r') as f:
+                data = json.load(f)
+                return datetime.fromisoformat(data['last_fetch'])
+        except Exception:
+            return None
+    return None
+
+def save_last_fetch_timestamp(timestamp: datetime):
+    """Save the timestamp of the last successful fetch."""
+    with open(TIMESTAMP_FILE, 'w') as f:
+        json.dump({'last_fetch': timestamp.isoformat()}, f)
+
+def load_cached_conversations():
+    """Load cached conversations from disk."""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'rb') as f:
+                return pickle.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_cached_conversations(conversations: List[Dict]):
+    """Save conversations to cache."""
+    with open(CACHE_FILE, 'wb') as f:
+        pickle.dump(conversations, f)
+
+def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counseling-bot-production", force_full_refresh: bool = False):
     """
-    Fetch conversation data from LangSmith traces.
+    Fetch conversation data from LangSmith traces with incremental updates.
+    
+    Args:
+        api_key: LangSmith API key
+        days: Number of days to look back on first run (default 7)
+        project_name: LangSmith project name
+        force_full_refresh: If True, ignores cache and fetches all data from scratch
     
     Returns data in format:
     {
@@ -27,10 +74,26 @@ def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counsel
     """
     client = Client(api_key=api_key)
     
-    end_time = datetime.now()
-    start_time = end_time - timedelta(days=days)
+    # Load existing cached conversations
+    if not force_full_refresh:
+        cached_conversations = load_cached_conversations()
+        last_fetch = get_last_fetch_timestamp()
+    else:
+        cached_conversations = []
+        last_fetch = None
     
-    conversations = []
+    # Determine time range for fetching
+    end_time = datetime.now()
+    if last_fetch and not force_full_refresh:
+        # Fetch only new data since last fetch (with 1 minute overlap to avoid gaps)
+        start_time = last_fetch - timedelta(minutes=1)
+        print(f"📥 Fetching incremental data since {start_time.strftime('%Y-%m-%d %H:%M:%S')}...")
+    else:
+        # First run or forced refresh - fetch all data from the past N days
+        start_time = end_time - timedelta(days=days)
+        print(f"📥 Fetching full data for the last {days} days...")
+    
+    new_conversations = []
     
     for run in client.list_runs(
         project_name=project_name,
@@ -67,9 +130,14 @@ def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counsel
         if not user_id and hasattr(run, 'session_id'):
             user_id = str(run.session_id) if run.session_id else None
         
-        # Fallback to generated name
+        # Fallback to session-based name
         if not user_name:
-            user_name = f"User-{hash(conversation_id) % 10000}"
+            if user_id:
+                # Use last 6 chars of session ID for more consistent naming
+                user_name = f"User-{user_id[-6:]}"
+            else:
+                # Last resort: use conversation ID
+                user_name = f"Guest-{conversation_id[-6:]}"
         
         if not user_id:
             user_id = str(conversation_id)
@@ -157,6 +225,9 @@ def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counsel
             bot_response and len(str(bot_response)) > 0
         )
         
+        # Build trace URL
+        trace_url = f"https://smith.langchain.com/o/{str(run.trace_id).split('-')[0] if hasattr(run, 'trace_id') and run.trace_id else ''}/projects/p/{project_name}/r/{conversation_id}"
+        
         conversation = {
             'conversation_id': conversation_id,
             'user_id': user_id,
@@ -171,12 +242,33 @@ def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counsel
             'total_tokens': total_tokens,
             'latency_ms': latency_ms,
             'user_input': user_input,
-            'bot_response': bot_response
+            'bot_response': bot_response,
+            'trace_url': trace_url
         }
         
-        conversations.append(conversation)
+        new_conversations.append(conversation)
     
-    return conversations
+    # Merge new conversations with cached ones
+    if cached_conversations and not force_full_refresh:
+        # Create a set of existing conversation IDs
+        existing_ids = {conv['conversation_id'] for conv in cached_conversations}
+        
+        # Add only truly new conversations (not in cache)
+        truly_new = [conv for conv in new_conversations if conv['conversation_id'] not in existing_ids]
+        
+        # Combine cached + new
+        all_conversations = cached_conversations + truly_new
+        
+        print(f"✅ Retrieved {len(truly_new)} new conversations (total: {len(all_conversations)})")
+    else:
+        all_conversations = new_conversations
+        print(f"✅ Retrieved {len(all_conversations)} conversations")
+    
+    # Save to cache for next run
+    save_cached_conversations(all_conversations)
+    save_last_fetch_timestamp(end_time)
+    
+    return all_conversations
 
 def calculate_cost(tokens: Optional[int], model: str = "gpt-4") -> float:
     """Calculate approximate cost based on tokens."""
