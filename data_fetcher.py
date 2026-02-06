@@ -15,7 +15,8 @@ TIMESTAMP_FILE = os.path.join(CACHE_DIR, 'last_fetch_timestamp.json')
 # Ensure cache directory exists
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-
+# Excluded usernames
+EXCLUDED_USERNAMES = {'Rawan_Youssif'}
 
 
 def get_last_fetch_timestamp():
@@ -35,11 +36,13 @@ def save_last_fetch_timestamp(timestamp: datetime):
         json.dump({'last_fetch': timestamp.isoformat()}, f)
 
 def load_cached_conversations():
-    """Load cached conversations from disk."""
+    """Load cached conversations from disk and filter excluded usernames."""
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, 'rb') as f:
-                return pickle.load(f)
+                conversations = pickle.load(f)
+                # Filter out excluded usernames
+                return [c for c in conversations if c.get('user_name') not in EXCLUDED_USERNAMES]
         except Exception:
             return []
     return []
@@ -126,6 +129,10 @@ def get_langsmith_data(api_key: str, days: int = 7, project_name: str = "counsel
             if input_username and not user_name:
                 user_name = str(input_username)
         
+        # Skip excluded usernames (check early to avoid processing)
+        if user_name and user_name in EXCLUDED_USERNAMES:
+            continue
+
         # Try session_id
         if not user_id and hasattr(run, 'session_id'):
             user_id = str(run.session_id) if run.session_id else None
