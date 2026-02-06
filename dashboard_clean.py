@@ -212,9 +212,12 @@ try:
     with col5:
         st.markdown("**🔁 Reset**")
         if st.button("Reset Date", use_container_width=True, help="Reset date range to Sept 1 - Today"):
-            st.session_state.date_range_start = default_start_date
-            st.session_state.date_range_end = default_end_date
+            # Clear all session state to force complete refresh
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            # Clear cache
             st.cache_data.clear()
+            # Rerun to apply changes
             st.rerun()
     
     st.markdown('</div>', unsafe_allow_html=True)
